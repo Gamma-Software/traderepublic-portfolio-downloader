@@ -837,7 +837,7 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 		// Extract data from sections
 		record := make(map[string]string)
 		record["ID"] = detail.ID
-		record["Type"] = "transaction" // Set default type to "transaction"
+		record["Type"] = transaction.Type
 		record["Amount Debit"] = "0"
 		record["Amount Credit"] = "0"
 		record["Currency"] = "EUR" // Default currency
@@ -915,7 +915,7 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 												if text == "Sparplan" {
 													isSparplan = true
 													record["Type"] = "savings plan"
-												} else {
+												} else if strings.Contains(text, "Kauf") || strings.Contains(text, "Verkauf") {
 													isTrading = true
 												}
 											}
@@ -1102,9 +1102,44 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 			}
 		}
 
+		// Check if it's a PEA activation bonus
+		isPEABonus := false
+		if !isInvestment && !isTransfer && len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
+			if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
+				for _, item := range tableData {
+					if itemMap, ok := item.(map[string]interface{}); ok {
+						if title, ok := itemMap["title"].(string); ok {
+							if title == "Ereignistyp" {
+								if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
+									if text, ok := detailObj["text"].(string); ok {
+										if text == "PEA-Aktivierung" {
+											isPEABonus = true
+											record["Type"] = "pea bonus"
+											record["Description"] = "PEA activation bonus"
+
+											// Extract amount from title (e.g., "Du hast 1.00 € erhalten")
+											title := detail.Sections[0].Title
+											re := regexp.MustCompile(`([0-9,.]+)\s*(€|EUR)\s+erhalten`)
+											matches := re.FindStringSubmatch(title)
+											if len(matches) > 1 {
+												amount, currency := cleanAmount(matches[1] + " " + matches[2])
+												record["Amount Credit"] = amount
+												record["Currency"] = currency
+											}
+											break
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Check if it's a top-up (Apple Pay, etc.)
 		isTopUp := false
-		if !isInvestment && !isTransfer && len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
+		if !isInvestment && !isTransfer && !isPEABonus && len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
 			if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
 				for _, item := range tableData {
 					if itemMap, ok := item.(map[string]interface{}); ok {
@@ -1146,7 +1181,7 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 
 		// Check if it's a dividend transaction
 		isDividend := false
-		if !isInvestment && !isTransfer && !isTopUp && len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
+		if !isInvestment && !isTransfer && !isTopUp && !isPEABonus && len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
 			if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
 				for _, item := range tableData {
 					if itemMap, ok := item.(map[string]interface{}); ok {
@@ -1175,23 +1210,25 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 												}
 											}
 
-											// Get amount from sections[2].data[3].detail.text (Gesamt)
-											if len(detail.Sections) > 2 && detail.Sections[2].Type == "table" {
-												if tableData2, ok := detail.Sections[2].Data.([]interface{}); ok {
-													if len(tableData2) > 3 {
-														if item2, ok := tableData2[3].(map[string]interface{}); ok {
-															if detail2, ok := item2["detail"].(map[string]interface{}); ok {
-																if text2, ok := detail2["text"].(string); ok {
-																	amount, currency := cleanAmount(text2)
-																	record["Amount Credit"] = amount
-																	record["Currency"] = currency
+													// Get amount from sections[2].data[3].detail.text (Gesamt)
+													if len(detail.Sections) > 2 && detail.Sections[2].Type == "table" {
+														if tableData2, ok := detail.Sections[2].Data.([]interface{}); ok {
+															if len(tableData2) > 3 {
+																if item2, ok := tableData2[3].(map[string]interface{}); ok {
+																	if detail2, ok := item2["detail"].(map[string]interface{}); ok {
+																		if text2, ok := detail2["text"].(string); ok {
+																			amount, currency := cleanAmount(text2)
+																			record["Amount Credit"] = amount
+																			record["Currency"] = currency
+																		}
+																	}
 																}
 															}
 														}
 													}
+													break
 												}
 											}
-											break
 										}
 									}
 								}
@@ -1219,23 +1256,25 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 												}
 											}
 
-											// Get amount from sections[2].data[3].detail.text (Gesamt)
-											if len(detail.Sections) > 2 && detail.Sections[2].Type == "table" {
-												if tableData2, ok := detail.Sections[2].Data.([]interface{}); ok {
-													if len(tableData2) > 3 {
-														if item2, ok := tableData2[3].(map[string]interface{}); ok {
-															if detail2, ok := item2["detail"].(map[string]interface{}); ok {
-																if text2, ok := detail2["text"].(string); ok {
-																	amount, currency := cleanAmount(text2)
-																	record["Amount Credit"] = amount
-																	record["Currency"] = currency
+													// Get amount from sections[2].data[3].detail.text (Gesamt)
+													if len(detail.Sections) > 2 && detail.Sections[2].Type == "table" {
+														if tableData2, ok := detail.Sections[2].Data.([]interface{}); ok {
+															if len(tableData2) > 3 {
+																if item2, ok := tableData2[3].(map[string]interface{}); ok {
+																	if detail2, ok := item2["detail"].(map[string]interface{}); ok {
+																		if text2, ok := detail2["text"].(string); ok {
+																			amount, currency := cleanAmount(text2)
+																			record["Amount Credit"] = amount
+																			record["Currency"] = currency
+																		}
+																	}
 																}
 															}
 														}
 													}
+													break
 												}
 											}
-											break
 										}
 									}
 								}
@@ -1248,7 +1287,7 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 
 		// Check if it's a savings transaction (Sparplan or Saveback)
 		isSavings := false
-		if !isInvestment && !isTransfer && !isTopUp && !isDividend && len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
+		if !isInvestment && !isTransfer && !isTopUp && !isDividend && !isPEABonus && len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
 			if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
 				if len(tableData) > 0 {
 					if item, ok := tableData[0].(map[string]interface{}); ok {
@@ -1321,7 +1360,7 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 
 		// Check if it's an interest payout
 		isInterestPayout := false
-		if !isInvestment && !isSavings && !isTransfer && !isTopUp && !isDividend {
+		if !isInvestment && !isSavings && !isTransfer && !isTopUp && !isDividend && !isPEABonus {
 			// Method 1: Check for interest icon in header
 			if len(detail.Sections) > 0 && detail.Sections[0].Type == "header" {
 				if headerData, ok := detail.Sections[0].Data.(map[string]interface{}); ok {
@@ -1407,156 +1446,7 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 					}
 				}
 			}
-		}
-
-		// Check if it's a PEA activation
-		isPEAActivation := false
-		if !isInvestment && !isSavings && !isTransfer && !isTopUp && !isDividend && !isInterestPayout {
-			// Look for "PEA-Aktivierung" in table sections
-			for _, section := range detail.Sections {
-				if section.Type == "table" {
-					if tableData, ok := section.Data.([]interface{}); ok {
-						for _, item := range tableData {
-							if itemMap, ok := item.(map[string]interface{}); ok {
-								if title, ok := itemMap["title"].(string); ok {
-									if title == "Ereignistyp" {
-										if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
-											if text, ok := detailObj["text"].(string); ok {
-												if text == "PEA-Aktivierung" {
-													isPEAActivation = true
-													record["Type"] = "pea activation"
-													record["Description"] = "PEA activation bonus"
-
-													// Extract amount from title (e.g., "Du hast 1.00 € erhalten")
-													if len(detail.Sections) > 0 {
-														title := detail.Sections[0].Title
-														re := regexp.MustCompile(`([0-9,.]+)\s*(€|EUR)\s+erhalten`)
-														matches := re.FindStringSubmatch(title)
-														if len(matches) > 1 {
-															amount, currency := cleanAmount(matches[1] + " " + matches[2])
-															record["Amount Credit"] = amount
-															record["Currency"] = currency
-														}
-													}
-													break
-												}
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-				if isPEAActivation {
-					break
-				}
-			}
-		}
-
-		// Check if it's a brokerage transaction
-		isBrokerage := false
-		if !isInvestment && !isSavings && !isTransfer && !isTopUp && !isDividend && !isInterestPayout && !isPEAActivation {
-			// Check for brokerage in first table section
-			if len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
-				if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
-					for _, item := range tableData {
-						if itemMap, ok := item.(map[string]interface{}); ok {
-							if title, ok := itemMap["title"].(string); ok {
-								if title == "Portfolio" {
-									if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
-										if text, ok := detailObj["text"].(string); ok {
-											if text == "Brokerage" {
-												isBrokerage = true
-												record["Type"] = "brokerage"
-												break
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		if isBrokerage {
-			// Get asset name and order type from first table section
-			var assetName, orderType string
-			if len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
-				if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
-					for _, item := range tableData {
-						if itemMap, ok := item.(map[string]interface{}); ok {
-							if title, ok := itemMap["title"].(string); ok {
-								if title == "Asset" {
-									if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
-										if text, ok := detailObj["text"].(string); ok {
-											assetName = text
-										}
-									}
-								} else if title == "Orderart" {
-									if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
-										if text, ok := detailObj["text"].(string); ok {
-											orderType = text
-											// Set type based on order type
-											if strings.Contains(text, "Kauf") {
-												record["Type"] = "stock purchase"
-											} else if strings.Contains(text, "Verkauf") {
-												record["Type"] = "stock sale"
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Get shares and price from transaction section
-			var shares, price string
-			if len(detail.Sections) > 2 && detail.Sections[2].Type == "table" {
-				if tableData, ok := detail.Sections[2].Data.([]interface{}); ok {
-					for _, item := range tableData {
-						if itemMap, ok := item.(map[string]interface{}); ok {
-							if title, ok := itemMap["title"].(string); ok {
-								if title == "Anteile" {
-									if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
-										if text, ok := detailObj["text"].(string); ok {
-											shares = text
-										}
-									}
-								} else if title == "Aktienkurs" {
-									if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
-										if text, ok := detailObj["text"].(string); ok {
-											price = text
-										}
-									}
-								} else if title == "Gesamt" {
-									if detailObj, ok := itemMap["detail"].(map[string]interface{}); ok {
-										if text, ok := detailObj["text"].(string); ok {
-											amount, currency := cleanAmount(text)
-											if strings.Contains(orderType, "Kauf") {
-												record["Amount Debit"] = amount
-											} else if strings.Contains(orderType, "Verkauf") {
-												record["Amount Credit"] = amount
-											}
-											record["Currency"] = currency
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Build description
-			record["Description"] = fmt.Sprintf("%s - %s shares at %s per share", assetName, shares, price)
-		}
-
-		if !isInvestment && !isSavings && !isTransfer && !isTopUp && !isDividend && !isInterestPayout && !isPEAActivation && !isBrokerage {
+		} else if !isInvestment && !isSavings && !isTransfer && !isTopUp && !isDividend && !isPEABonus {
 			// For regular transactions, get description and amount from second section
 			if len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
 				if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
@@ -1590,11 +1480,6 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 					}
 				}
 			}
-		}
-
-		// Remove commas from the Description field
-		if desc, ok := record["Description"]; ok {
-			record["Description"] = strings.ReplaceAll(desc, ",", ".")
 		}
 
 		// Write record to CSV
