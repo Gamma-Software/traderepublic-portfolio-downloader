@@ -106,10 +106,28 @@ func WithSessionToken(token string) ClientOption {
 type Client struct {
 	conn         *websocket.Conn
 	sessionToken string
+	tokenMu      sync.RWMutex
 	logger       *slog.Logger
 	subID        uint
 	mu           sync.Mutex
 	closed       bool
+}
+
+// SetSessionToken atomically updates the session token used for new subscriptions.
+// Safe to call from a background refresher goroutine while subscriptions are in flight.
+func (c *Client) SetSessionToken(token string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+
+	c.sessionToken = token
+}
+
+// getSessionToken returns the current session token under a read lock.
+func (c *Client) getSessionToken() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+
+	return c.sessionToken
 }
 
 // NewClient creates a new WebSocket client.
@@ -191,7 +209,7 @@ func (c *Client) Close() error {
 func (c *Client) prepareSubscription(dataType string, params map[string]any) map[string]any {
 	data := map[string]any{
 		"type":  dataType,
-		"token": c.sessionToken,
+		"token": c.getSessionToken(),
 	}
 
 	// Add additional parameters
@@ -241,7 +259,8 @@ func (c *Client) subscribe(ctx context.Context, data map[string]any) (<-chan []b
 		return nil, ErrConnectionClosed
 	}
 
-	if c.sessionToken == "" {
+	token := c.getSessionToken()
+	if token == "" {
 		return nil, ErrAuthRequired
 	}
 
@@ -249,7 +268,7 @@ func (c *Client) subscribe(ctx context.Context, data map[string]any) (<-chan []b
 	subID := c.subID
 
 	// Add token to data
-	data["token"] = c.sessionToken
+	data["token"] = token
 
 	// Marshal data to JSON
 	dataBytes, err := json.Marshal(data)
@@ -374,7 +393,7 @@ func (c *Client) unsubscribe(subID uint) {
 
 	// Create unsubscribe message
 	data := map[string]any{
-		"token": c.sessionToken,
+		"token": c.getSessionToken(),
 	}
 
 	// Marshal data to JSON

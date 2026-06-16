@@ -4,7 +4,9 @@ import "time"
 
 const (
 	// RestAPIBaseURI Trade Republic's REST API base URI.
-	RestAPIBaseURI = "https://api.traderepublic.com/api/v1"
+	// Trailing slash is required: oapi-codegen resolves operation paths relatively
+	// (e.g. "./auth/web/login"), and without it RFC 3986 resolution drops the "/v1" segment.
+	RestAPIBaseURI = "https://api.traderepublic.com/api/v1/"
 
 	// WebsocketBaseHost Trade Republic's websocket base host.
 	WebsocketBaseHost = "api.traderepublic.com"
@@ -17,6 +19,14 @@ const (
 	SessionRefreshInterval = 120
 
 	AuthTokenFilename = "./.auth"
+
+	// TRAppVersion sent as X-TR-App-Version on auth endpoints.
+	TRAppVersion = "15.65.6"
+
+	// TRDeviceInfo sent as X-TR-Device-Info (base64 JSON device fingerprint) on auth endpoints.
+	// This is a generic, non-personal default; the stableDeviceId is client-generated and not
+	// validated by TR. Override with the TR_DEVICE_INFO env var to use your own browser's value.
+	TRDeviceInfo = "eyJzdGFibGVEZXZpY2VJZCI6IjcxY2I3MzgxMjRkN2Y2YWE0ZTJiMjY0YmIxODQ4OWY1NTIwYWZkYzAwYjRjMzU0ODAzYTYwOThmZDYxYmQwZDFiNjdkY2YzNGQyMWI2ZTRmNTU4ZmNjNTA0NjU1ZjQ5NGI2YTczYzUxNDRkMWQ1NWZhY2MxMjkyMDAzZmU0YTEwIiwibW9kZWwiOiJBcHBsZSBNYWNpbnRvc2giLCJicm93c2VyIjoiU2FmYXJpIiwiYnJvd3NlclZlcnNpb24iOiIyNi41Iiwib3MiOiJNYWMgT1MiLCJvc1ZlcnNpb24iOiIxMC4xNS43IiwidGltZXpvbmUiOiJFdXJvcGUvQmVybGluIiwidGltZXpvbmVPZmZzZXQiOi02MCwic2NyZWVuIjoiMTkyMHgxMDgweDI0IiwicHJlZmVycmVkTGFuZ3VhZ2VzIjpbImVuLVVTIl0sIm51bWJlck9mQ29yZXMiOjh9"
 
 	// ResponseActionTypeTimelineDetail represents the value the app will look for in order to determine
 	// if any details can be fetched.

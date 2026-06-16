@@ -15,4 +15,7 @@ type ClientInterface interface {
 
 	// PostOTP verifies the OTP.
 	PostOTP(processID, otp string) ([]*http.Cookie, error)
+
+	// RefreshSession exchanges the refresh token for a fresh session token.
+	RefreshSession(refreshToken string) (string, error)
 }

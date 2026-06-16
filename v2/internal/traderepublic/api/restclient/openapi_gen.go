@@ -195,10 +195,8 @@ func NewLoginRequestWithBody(server string, contentType string, body io.Reader) 
 		return nil, err
 	}
 
-	operationPath := fmt.Sprintf("/auth/web/login")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
+	// TR moved web login from v1 to v2; base URI is .../api/v1/ so resolve up one level.
+	operationPath := "../v2/auth/web/login"
 
 	queryURL, err := serverURL.Parse(operationPath)
 	if err != nil {

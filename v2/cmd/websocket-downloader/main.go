@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,7 +19,9 @@ import (
 	"github.com/dhojayev/traderepublic-portfolio-downloader/v2/internal/console"
 	"github.com/dhojayev/traderepublic-portfolio-downloader/v2/internal/traderepublic/api"
 	"github.com/dhojayev/traderepublic-portfolio-downloader/v2/internal/traderepublic/api/auth"
+	"github.com/dhojayev/traderepublic-portfolio-downloader/v2/internal/traderepublic/api/restclient"
 	"github.com/dhojayev/traderepublic-portfolio-downloader/v2/internal/traderepublic/api/websocketclient"
+	"github.com/dhojayev/traderepublic-portfolio-downloader/v2/internal/waf"
 	"github.com/joho/godotenv"
 )
 
@@ -64,6 +67,10 @@ type Config struct {
 	timeoutSecs int
 	exportCSV   bool
 	offline     bool
+	authOnly    bool
+	initAuth    bool
+	last3Months bool
+	fromDate    string
 }
 
 // parseFlags parses command line flags and returns a Config.
@@ -75,6 +82,10 @@ func parseFlags() Config {
 	flag.IntVar(&config.timeoutSecs, "timeout", defaultTimeoutSeconds, "Timeout in seconds for the entire operation")
 	flag.BoolVar(&config.exportCSV, "export-csv", false, "Export transactions to CSV file")
 	flag.BoolVar(&config.offline, "offline", false, "Use existing files in debug folder without downloading from API")
+	flag.BoolVar(&config.authOnly, "auth-only", false, "Only perform authentication and generate token")
+	flag.BoolVar(&config.initAuth, "init-auth", false, "Start login and exit (approve in the app, then run again)")
+	flag.BoolVar(&config.last3Months, "last-3-months", false, "Only process transactions from the last 3 months")
+	flag.StringVar(&config.fromDate, "from-date", "", "Only process transactions from this date (format: YYYY-MM-DD)")
 	flag.Parse()
 
 	return config
@@ -90,107 +101,183 @@ func setupLogger(debug bool) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stdout, logOpts))
 }
 
-// authenticate performs authentication and returns a session token.
-//
-//nolint:cyclop,funlen
-func authenticate(logger *slog.Logger) (string, error) {
-	// Create credentials service for storing tokens
-	credentials := auth.NewFileCredentialsService(internal.AuthTokenFilename)
-
-	// Try to load existing tokens first
-	if err := credentials.Load(); err == nil {
-		sessionToken := credentials.GetSessionToken()
-		if sessionToken != "" {
-			logger.Info("Using existing session token")
-
-			// We'll verify the token by making a test API call later
-			// If it fails, we'll need to re-authenticate
-			return sessionToken, nil
-		}
-	}
-
-	// Create input handler for user interaction
+// readCredentials returns the phone number and PIN from env vars, prompting interactively
+// for whichever is missing.
+func readCredentials() (string, string, error) {
 	inputHandler := console.NewInputHandler()
 
-	// If no valid tokens found, proceed with authentication
 	phoneNumber := os.Getenv("TR_PHONE_NUMBER")
 	pin := os.Getenv("TR_PIN")
 
-	// If environment variables are not set, prompt the user
+	var err error
+
 	if phoneNumber == "" {
-		var err error
-
-		phoneNumber, err = inputHandler.GetPhoneNumber()
-		if err != nil {
-			logger.Error("Failed to get phone number", "error", err)
-
-			return "", fmt.Errorf("failed to get phone number: %w", err)
+		if phoneNumber, err = inputHandler.GetPhoneNumber(); err != nil {
+			return "", "", fmt.Errorf("failed to get phone number: %w", err)
 		}
 	}
 
 	if pin == "" {
-		var err error
-
-		pin, err = inputHandler.GetPIN()
-		if err != nil {
-			logger.Error("Failed to get PIN", "error", err)
-
-			return "", fmt.Errorf("failed to get PIN: %w", err)
+		if pin, err = inputHandler.GetPIN(); err != nil {
+			return "", "", fmt.Errorf("failed to get PIN: %w", err)
 		}
 	}
 
-	// Create API client and authenticate
-	apiClient, err := api.NewClient()
-	if err != nil {
-		logger.Error("Failed to create API client", "error", err)
+	return phoneNumber, pin, nil
+}
 
-		return "", fmt.Errorf("failed to create API client: %w", err)
+// ensureWAFToken makes sure a TR_WAF_TOKEN is available for the auth requests, generating
+// one with a headless browser when the env var is empty.
+func ensureWAFToken(logger *slog.Logger) {
+	if os.Getenv("TR_WAF_TOKEN") != "" {
+		return
 	}
 
-	// Create auth client
-	authClient, err := auth.NewClient(apiClient)
+	token, err := waf.GetToken(context.Background(), logger, waf.DefaultTimeout)
 	if err != nil {
-		logger.Error("Failed to create auth client", "error", err)
+		logger.Warn("Could not auto-generate AWS WAF token; set TR_WAF_TOKEN manually if login fails",
+			"error", err)
 
-		return "", fmt.Errorf("failed to create auth client: %w", err)
+		return
 	}
 
-	// Login
-	processID, err := authClient.Login(auth.PhoneNumber(phoneNumber), auth.Pin(pin))
-	if err != nil {
-		logger.Error("Failed to login", "error", err)
+	if err := os.Setenv("TR_WAF_TOKEN", token); err != nil {
+		logger.Warn("Could not set TR_WAF_TOKEN", "error", err)
+	}
+}
+
+// loginRateLimitWait returns the seconds to back off from a TOO_MANY_REQUESTS error, or 0.
+func loginRateLimitWait(err error) int {
+	if !strings.Contains(err.Error(), "TOO_MANY_REQUESTS") {
+		return 0
+	}
+
+	matches := regexp.MustCompile(`nextAttemptInSeconds":(\d+)`).FindStringSubmatch(err.Error())
+	if len(matches) > 1 {
+		wait, _ := strconv.Atoi(matches[1])
+
+		return wait
+	}
+
+	return 0
+}
+
+// startLogin performs the v2 login with simple rate-limit retry and returns the processId.
+func startLogin(logger *slog.Logger, apiClient *api.Client, phone, pin string) (string, error) {
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		processID, err := apiClient.Login(restclient.APILoginRequest{PhoneNumber: phone, Pin: pin})
+		if err == nil {
+			return processID, nil
+		}
+
+		if wait := loginRateLimitWait(err); wait > 0 {
+			logger.Info("Rate limited, waiting before retry", "seconds", wait)
+			time.Sleep(time.Duration(wait) * time.Second)
+
+			continue
+		}
 
 		return "", fmt.Errorf("failed to login: %w", err)
 	}
 
-	if processID != "" {
-		// Get OTP from user
-		otp, err := inputHandler.GetOTP()
+	return "", fmt.Errorf("failed to login after %d retries", maxRetries)
+}
+
+// waitForApproval polls the login process until the user approves it in the mobile app,
+// then returns the session/refresh tokens from the response cookies.
+func waitForApproval(logger *slog.Logger, apiClient *api.Client, processID string) (auth.Token, error) {
+	const (
+		pollInterval = 2 * time.Second
+		pollTimeout  = 2 * time.Minute
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), pollTimeout)
+	defer cancel()
+
+	logger.Info("Login started — approve the web login in your Trade Republic mobile app")
+
+	for {
+		status, cookies, err := apiClient.PollLoginStatus(ctx, processID)
 		if err != nil {
-			logger.Error("Failed to get OTP", "error", err)
-
-			return "", fmt.Errorf("failed to get OTP: %w", err)
+			return auth.Token{}, fmt.Errorf("failed to poll login status: %w", err)
 		}
 
-		// Get tokens from OTP verification
-		token, err := authClient.ProvideOTP(processID, auth.OTP(otp))
-		if err != nil {
-			logger.Error("Failed to validate OTP", "error", err)
+		switch status {
+		case "CONFIRMED":
+			token := auth.ExtractTokenFromCookies(cookies)
+			if token.SessionToken() == "" {
+				return auth.Token{}, errors.New("login confirmed but no session token returned")
+			}
 
-			return "", fmt.Errorf("failed to validate OTP: %w", err)
+			return token, nil
+		case "REJECTED", "CANCELED", "EXPIRED":
+			return auth.Token{}, fmt.Errorf("login %s", status)
 		}
 
-		// Store tokens using credentials service
-		if err := credentials.Store(token.SessionToken(), token.RefreshToken()); err != nil {
-			logger.Error("Failed to store tokens", "error", err)
+		select {
+		case <-ctx.Done():
+			return auth.Token{}, fmt.Errorf("timed out waiting for app approval: %w", ctx.Err())
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+// authenticate performs the Trade Republic web login (app-approval flow) and returns a
+// session token, reusing a cached token from the auth file when present.
+func authenticate(logger *slog.Logger, config Config) (string, error) {
+	credentials := auth.NewFileCredentialsService(internal.AuthTokenFilename)
+
+	if config.authOnly {
+		if err := os.Remove(internal.AuthTokenFilename); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("failed to remove existing auth file: %w", err)
 		}
 
-		return token.SessionToken(), nil
+		logger.Info("Removed existing auth file")
+	}
+
+	if err := credentials.Load(); err == nil && credentials.GetSessionToken() != "" {
+		logger.Info("Using existing session token")
+
+		return credentials.GetSessionToken(), nil
+	}
+
+	phoneNumber, pin, err := readCredentials()
+	if err != nil {
+		return "", err
+	}
+
+	ensureWAFToken(logger)
+
+	apiClient, err := api.NewClient()
+	if err != nil {
+		return "", fmt.Errorf("failed to create API client: %w", err)
+	}
+
+	processID, err := startLogin(logger, apiClient, phoneNumber, pin)
+	if err != nil {
+		return "", err
+	}
+
+	if config.initAuth {
+		logger.Info("Login initiated — approve it in your Trade Republic app, then run again")
+
+		return "", nil
+	}
+
+	token, err := waitForApproval(logger, apiClient, processID)
+	if err != nil {
+		return "", err
+	}
+
+	if err := credentials.Store(token.SessionToken(), token.RefreshToken()); err != nil {
+		logger.Warn("Failed to store tokens", "error", err)
 	}
 
 	logger.Info("Successfully authenticated")
 
-	return credentials.GetSessionToken(), nil
+	return token.SessionToken(), nil
 }
 
 // setupWebSocketClient creates and connects a WebSocket client.
@@ -224,6 +311,52 @@ func setupWebSocketClient(
 	logger.Info("Connected to WebSocket, subscribing to timeline transactions...")
 
 	return wsClient, ctx, cancel, nil
+}
+
+// startSessionRefresher periodically exchanges the refresh token for a fresh session
+// token and pushes it into the WebSocket client, so runs longer than the ~5 min session
+// lifetime (large portfolios) keep authenticating instead of dropping the tail.
+func startSessionRefresher(
+	ctx context.Context,
+	logger *slog.Logger,
+	apiClient *api.Client,
+	wsClient *websocketclient.Client,
+	credentials *auth.FileCredentialsService,
+	refreshToken string,
+) {
+	if refreshToken == "" {
+		logger.Warn("No refresh token available; session will not be refreshed")
+
+		return
+	}
+
+	ticker := time.NewTicker(internal.SessionRefreshInterval * time.Second)
+
+	go func() {
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				newToken, err := apiClient.RefreshSession(refreshToken)
+				if err != nil {
+					logger.Warn("Failed to refresh session token", "error", err)
+
+					continue
+				}
+
+				wsClient.SetSessionToken(newToken)
+
+				if err := credentials.Store(newToken, refreshToken); err != nil {
+					logger.Warn("Failed to persist refreshed token", "error", err)
+				}
+
+				logger.Info("Session token refreshed")
+			}
+		}
+	}()
 }
 
 // fetchAllTransactions fetches all transactions with pagination.
@@ -588,20 +721,19 @@ func saveTransactionsAsCSV(logger *slog.Logger, transactions []TransactionItem) 
 	return nil
 }
 
-// cleanAmount converts various amount formats to a consistent decimal string and returns the currency code
+// cleanAmount converts various amount formats to a consistent decimal string and returns the currency code.
+// Trade Republic formats amounts in German locale (dot = thousands separator, comma = decimal),
+// e.g. "1.234,56 €" -> "1234.56".
 func cleanAmount(amount string) (string, string) {
-	// Define currency symbols and their codes
 	currencyMap := map[string]string{
-		"€": "EUR",
-		"$": "USD",
+		"€":   "EUR",
+		"$":   "USD",
 		"TND": "TND",
-		// Add more currencies as needed
 	}
 
-	// Default currency code
 	currencyCode := "EUR"
 
-	// Check for currency codes
+	// Strip currency symbols (and remember the code).
 	for symbol, code := range currencyMap {
 		if strings.Contains(amount, symbol) {
 			currencyCode = code
@@ -609,19 +741,76 @@ func cleanAmount(amount string) (string, string) {
 		}
 	}
 
-	// Remove any spaces
-	amount = strings.ReplaceAll(amount, " ", "")
+	// Strip currency codes that may appear as text (EUR/USD/TND).
+	for _, code := range currencyMap {
+		amount = strings.ReplaceAll(amount, code, "")
+	}
 
-	// Remove the plus sign if present
+	// Drop spaces (including non-breaking) and a leading plus sign.
+	amount = strings.ReplaceAll(amount, " ", "")
+	amount = strings.ReplaceAll(amount, " ", "")
 	amount = strings.TrimPrefix(amount, "+")
 
-	// Replace comma with dot for decimal point
-	amount = strings.ReplaceAll(amount, ",", ".")
+	// Normalise separators. German style uses "." for thousands and "," for decimals.
+	hasDot := strings.Contains(amount, ".")
+	hasComma := strings.Contains(amount, ",")
 
-	// Trim any remaining whitespace
-	amount = strings.TrimSpace(amount)
+	switch {
+	case hasDot && hasComma:
+		amount = strings.ReplaceAll(amount, ".", "")
+		amount = strings.ReplaceAll(amount, ",", ".")
+	case hasComma:
+		amount = strings.ReplaceAll(amount, ",", ".")
+	}
 
-	return amount, currencyCode
+	return strings.TrimSpace(amount), currencyCode
+}
+
+// isNumericAmount reports whether a cleaned amount string parses as a number.
+func isNumericAmount(cleaned string) bool {
+	if cleaned == "" {
+		return false
+	}
+
+	_, err := strconv.ParseFloat(cleaned, 64)
+
+	return err == nil
+}
+
+// extractAmountFromTable scans a TR detail table for the first cell whose text is a monetary
+// value, returning the cleaned amount, currency, and whether it is a credit (leading "+").
+// This is more robust than reading a fixed row index, which varies by transaction layout.
+func extractAmountFromTable(tableData []interface{}) (amount, currency string, isCredit, found bool) {
+	for _, item := range tableData {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		detailObj, ok := itemMap["detail"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		text, ok := detailObj["text"].(string)
+		if !ok || text == "" {
+			continue
+		}
+
+		// Only consider cells that actually carry a currency value.
+		if !strings.ContainsAny(text, "€$") && !strings.Contains(text, "EUR") {
+			continue
+		}
+
+		cleaned, code := cleanAmount(text)
+		if !isNumericAmount(cleaned) {
+			continue
+		}
+
+		return cleaned, code, strings.HasPrefix(strings.TrimSpace(text), "+"), true
+	}
+
+	return "", "", false, false
 }
 
 // formatDate converts various timestamp formats to a consistent format
@@ -1078,9 +1267,9 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 														if payload, ok := action["payload"].(map[string]interface{}); ok {
 															if contextParams, ok := payload["contextParams"].(map[string]interface{}); ok {
 																if amount, ok := contextParams["amount"].(string); ok {
-																	// Check if amount starts with minus
-																	if strings.HasPrefix(amount, "-") {
-																		record["Amount Credit"] = strings.TrimPrefix(amount, "-")
+																	// For transfers, if the title contains "erhalten" (received), it's a credit
+																	if strings.Contains(detail.Sections[0].Title, "erhalten") {
+																		record["Amount Credit"] = amount
 																	} else {
 																		record["Amount Debit"] = amount
 																	}
@@ -1557,36 +1746,32 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 		}
 
 		if !isInvestment && !isSavings && !isTransfer && !isTopUp && !isDividend && !isInterestPayout && !isPEAActivation && !isBrokerage {
-			// For regular transactions, get description and amount from second section
+			// For regular transactions, get description and amount from second section.
 			if len(detail.Sections) > 1 && detail.Sections[1].Type == "table" {
 				if tableData, ok := detail.Sections[1].Data.([]interface{}); ok {
-					// Get description (index 2)
+					// Description: index 2 holds it, but only if it is not itself a currency value.
 					if len(tableData) > 2 {
 						if item, ok := tableData[2].(map[string]interface{}); ok {
-							if detail, ok := item["detail"].(map[string]interface{}); ok {
-								if text, ok := detail["text"].(string); ok {
-									record["Description"] = text
+							if d, ok := item["detail"].(map[string]interface{}); ok {
+								if text, ok := d["text"].(string); ok {
+									cleaned, _ := cleanAmount(text)
+									if !isNumericAmount(cleaned) {
+										record["Description"] = text
+									}
 								}
 							}
 						}
 					}
 
-					// Get amount (index 3)
-					if len(tableData) > 3 {
-						if item, ok := tableData[3].(map[string]interface{}); ok {
-							if detail, ok := item["detail"].(map[string]interface{}); ok {
-								if text, ok := detail["text"].(string); ok {
-									amount, currency := cleanAmount(text)
-									// Check if it's a credit (starts with +)
-									if len(text) > 0 && text[0] == '+' {
-										record["Amount Credit"] = amount
-									} else {
-										record["Amount Debit"] = amount
-									}
-									record["Currency"] = currency
-								}
-							}
+					// Amount: scan for the monetary cell instead of trusting a fixed index,
+					// which previously let asset names leak into the amount columns.
+					if amount, currency, isCredit, found := extractAmountFromTable(tableData); found {
+						if isCredit {
+							record["Amount Credit"] = amount
+						} else {
+							record["Amount Debit"] = amount
 						}
+						record["Currency"] = currency
 					}
 				}
 			}
@@ -1595,6 +1780,24 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 		// Remove commas from the Description field
 		if desc, ok := record["Description"]; ok {
 			record["Description"] = strings.ReplaceAll(desc, ",", ".")
+		}
+
+		// Date fallback: some details (e.g. round-ups) carry no header timestamp;
+		// use the timeline item's timestamp instead of emitting N/A.
+		if record["Date"] == "" && transaction.Timestamp != "" {
+			record["Date"] = formatDate(transaction.Timestamp)
+		}
+
+		// Defensive net: never let a non-numeric value land in a numeric column.
+		for _, col := range []string{"Amount Debit", "Amount Credit"} {
+			if !isNumericAmount(record[col]) {
+				if record[col] != "" && record[col] != "0" {
+					logger.Warn("Discarded non-numeric amount",
+						"id", transaction.ID, "column", col, "value", record[col])
+				}
+
+				record[col] = "0"
+			}
 		}
 
 		// Write record to CSV
@@ -1609,6 +1812,35 @@ func exportTransactionsToCSV(logger *slog.Logger, transactions []TransactionItem
 		if err := writer.Write(row); err != nil {
 			logger.Warn("Failed to write CSV record", "id", transaction.ID, "error", err)
 			continue
+		}
+
+		// If Saveback, add an additional credit line
+		if record["Type"] == "saveback" && record["Amount Debit"] != "0" {
+			creditRow := make([]string, len(headers))
+			for i, header := range headers {
+				switch header {
+				case "ID":
+					creditRow[i] = record["ID"]
+				case "Date":
+					creditRow[i] = record["Date"]
+				case "Type":
+					creditRow[i] = "saveback"
+				case "Description":
+					creditRow[i] = "Your Saveback payment"
+				case "Amount Debit":
+					creditRow[i] = "0"
+				case "Amount Credit":
+					creditRow[i] = record["Amount Debit"]
+				case "Currency":
+					creditRow[i] = record["Currency"]
+				default:
+					creditRow[i] = "N/A"
+				}
+			}
+			if err := writer.Write(creditRow); err != nil {
+				logger.Warn("Failed to write Saveback credit CSV record", "id", transaction.ID, "error", err)
+				continue
+			}
 		}
 
 		logger.Debug("Wrote transaction to CSV", "id", transaction.ID)
@@ -1665,76 +1897,172 @@ func loadTransactionsFromDebug(logger *slog.Logger) ([]TransactionItem, error) {
 	return transactions, nil
 }
 
+// filterTransactionsByDate filters transactions to only include those from the last 3 months
+func filterTransactionsByDate(transactions []TransactionItem, config Config) []TransactionItem {
+	if !config.last3Months && config.fromDate == "" {
+		return transactions
+	}
+
+	var filtered []TransactionItem
+	var cutoffTime time.Time
+
+	if config.last3Months {
+		cutoffTime = time.Now().AddDate(0, -3, 0)
+	} else if config.fromDate != "" {
+		var err error
+		cutoffTime, err = time.Parse("2006-01-02", config.fromDate)
+		if err != nil {
+			// If date parsing fails, return all transactions
+			return transactions
+		}
+		// Set cutoff time to start of the day
+		cutoffTime = time.Date(cutoffTime.Year(), cutoffTime.Month(), cutoffTime.Day(), 0, 0, 0, 0, time.UTC)
+	}
+
+	logger := slog.Default()
+	logger.Info("Filtering transactions by date",
+		"cutoff_date", cutoffTime.Format("2006-01-02 15:04:05"),
+		"total_transactions", len(transactions))
+
+	// Define all possible timestamp formats
+	formats := []string{
+		time.RFC3339,                    // 2025-06-01T14:03:13.686252+02:00
+		"2006-01-02T15:04:05.000-0700", // 2025-06-01T09:38:50.444+0000
+		"2006-01-02T15:04:05.000Z0700", // 2025-06-01T09:38:50.444+0000
+		"2006-01-02T15:04:05-0700",     // 2025-06-01T09:38:50+0000
+		"2006-01-02T15:04:05Z0700",     // 2025-06-01T09:38:50+0000
+	}
+
+	for _, t := range transactions {
+		var transactionTime time.Time
+		var parseErr error
+
+		// Try each format until we find one that works
+		for _, format := range formats {
+			transactionTime, parseErr = time.Parse(format, t.Timestamp)
+			if parseErr == nil {
+				break
+			}
+		}
+
+		if parseErr != nil {
+			logger.Warn("Failed to parse transaction timestamp",
+				"transaction_id", t.ID,
+				"timestamp", t.Timestamp,
+				"error", parseErr)
+			// If timestamp parsing fails, include the transaction
+			filtered = append(filtered, t)
+			continue
+		}
+
+		// Convert transaction time to UTC for comparison
+		transactionTime = transactionTime.UTC()
+
+		if transactionTime.After(cutoffTime) || transactionTime.Equal(cutoffTime) {
+			filtered = append(filtered, t)
+		} else {
+			logger.Debug("Filtered out transaction",
+				"transaction_id", t.ID,
+				"transaction_date", transactionTime.Format("2006-01-02 15:04:05"),
+				"cutoff_date", cutoffTime.Format("2006-01-02 15:04:05"))
+		}
+	}
+
+	logger.Info("Date filtering complete",
+		"original_count", len(transactions),
+		"filtered_count", len(filtered))
+
+	return filtered
+}
+
 func main() {
-	// Use this variable to track exit code
-	var exitCode int
-	defer func() {
-		os.Exit(exitCode)
-	}()
+	// Load environment variables from .env file
+	if err := godotenv.Load(); err != nil {
+		// Ignore error if .env file doesn't exist
+	}
 
-	_ = godotenv.Load(".env")
-
-	// Parse command line flags and set up logging
+	// Parse command line flags
 	config := parseFlags()
+
+	// Setup logger
 	logger := setupLogger(config.debug)
 
-	// Create directories for saving responses
+	// Create required directories
 	if err := createDirectories(); err != nil {
 		logger.Error("Failed to create directories", "error", err)
-		exitCode = 1
+		os.Exit(1)
+	}
+
+	// If offline mode is enabled, load transactions from debug folder
+	if config.offline {
+		transactions, err := loadTransactionsFromDebug(logger)
+		if err != nil {
+			logger.Error("Failed to load transactions from debug folder", "error", err)
+			os.Exit(1)
+		}
+
+		// Filter transactions by date if needed
+		transactions = filterTransactionsByDate(transactions, config)
+
+		// Export to CSV if requested
+		if config.exportCSV {
+			if err := exportTransactionsToCSV(logger, transactions); err != nil {
+				logger.Error("Failed to export transactions to CSV", "error", err)
+				os.Exit(1)
+			}
+		}
+
 		return
 	}
 
-	var allTransactions []TransactionItem
-	var err error
-
-	if config.offline {
-		logger.Info("Running in offline mode, using existing files from debug folder")
-		allTransactions, err = loadTransactionsFromDebug(logger)
-		if err != nil {
-			logger.Error("Failed to load transactions from debug folder", "error", err)
-			exitCode = 1
-			return
-		}
-	} else {
-		// Authenticate and get session token
-		sessionToken, err := authenticate(logger)
-		if err != nil {
-			exitCode = 1
-			return
-		}
-
-		// Create and connect WebSocket client
-		wsClient, ctx, cancel, err := setupWebSocketClient(logger, sessionToken, config.timeoutSecs)
-		if err != nil {
-			exitCode = 1
-			return
-		}
-
-		defer cancel()
-		defer wsClient.Close()
-
-		logger.Info("Will save both raw and formatted responses to the filesystem")
-
-		// Fetch all transactions
-		allTransactions, err = fetchAllTransactions(ctx, logger, wsClient)
-		if err != nil {
-			exitCode = 1
-			return
-		}
-
-		// Process transactions
-		processTransactions(ctx, logger, wsClient, allTransactions, config.maxItems)
+	// Authenticate and get session token
+	sessionToken, err := authenticate(logger, config)
+	if err != nil {
+		logger.Error("Failed to authenticate", "error", err)
+		os.Exit(1)
 	}
+
+	// If authOnly or initAuth is true, exit here
+	if config.authOnly || config.initAuth {
+		return
+	}
+
+	// Setup WebSocket client
+	wsClient, ctx, cancel, err := setupWebSocketClient(logger, sessionToken, config.timeoutSecs)
+	if err != nil {
+		logger.Error("Failed to setup WebSocket client", "error", err)
+		os.Exit(1)
+	}
+	defer cancel()
+
+	// Start background session refresher to keep long runs authenticated.
+	credentials := auth.NewFileCredentialsService(internal.AuthTokenFilename)
+	_ = credentials.Load()
+
+	if apiClient, apiErr := api.NewClient(); apiErr != nil {
+		logger.Warn("Could not create API client for session refresher", "error", apiErr)
+	} else {
+		startSessionRefresher(ctx, logger, apiClient, wsClient, credentials, credentials.GetRefreshToken())
+	}
+
+	// Fetch all transactions
+	transactions, err := fetchAllTransactions(ctx, logger, wsClient)
+	if err != nil {
+		logger.Error("Failed to fetch transactions", "error", err)
+		os.Exit(1)
+	}
+
+	// Filter transactions by date if needed
+	transactions = filterTransactionsByDate(transactions, config)
+
+	// Process transactions
+	processTransactions(ctx, logger, wsClient, transactions, config.maxItems)
 
 	// Export to CSV if requested
 	if config.exportCSV {
-		if err := exportTransactionsToCSV(logger, allTransactions); err != nil {
+		if err := exportTransactionsToCSV(logger, transactions); err != nil {
 			logger.Error("Failed to export transactions to CSV", "error", err)
-			exitCode = 1
-			return
+			os.Exit(1)
 		}
 	}
-
-	logger.Info("All operations completed successfully")
 }

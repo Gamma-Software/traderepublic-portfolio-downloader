@@ -1,8 +1,14 @@
 *.csv
 *.db
+.env
 /.session
 /.refresh
 /responses
 /documents
 vendor
 .DS_Store
+
+# compiled binaries
+/websocket-downloader
+/v2/websocket-downloader
+/portfoliodownloader
